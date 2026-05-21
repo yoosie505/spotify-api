@@ -63,7 +63,11 @@ class handler(BaseHTTPRequestHandler):
                     return
             
             # Jika HTTP 204 (Tidak ada lagu/Spotify sedang dijeda)
-            self.kirim({"title": "Spotify Terhenti", "artist": "-"})
+            # Debugging error
+            self.kirim({
+                "title": f"Status: {res_lagu.status_code}", 
+                "artist": res_lagu.text if res_lagu.text else "Kosong"
+            })
             
         except Exception as e:
             self.kirim({"title": "Error Script", "artist": str(e)})
