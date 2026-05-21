@@ -6,8 +6,8 @@ import json
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         # 1. Ambil API Key dan Username dari Vercel
-        api_key = os.environ.get('2382657f68d0eadf265a4c302481cd9d')
-        username = os.environ.get('Musanis')
+        api_key = os.environ.get('LASTFM_API_KEY')
+        username = os.environ.get('LASTFM_USER')
 
         # Cegah error jika Environment Variable belum diisi
         if not api_key or not username:
