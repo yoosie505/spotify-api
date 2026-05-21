@@ -14,15 +14,24 @@ class handler(BaseHTTPRequestHandler):
         auth_b64 = base64.b64encode(auth_str.encode()).decode()
         
         try:
-            # 1. Tukar Token
+            # 1. Tukar Token ke Server Asli Spotify
             res_token = requests.post(
                 "https://accounts.spotify.com/api/token",
                 headers={"Authorization": f"Basic {auth_b64}"},
                 data={"grant_type": "refresh_token", "refresh_token": refresh_token}
             )
+            
+            # Cek jika token gagal
+            if res_token.status_code != 200:
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"title": "Error Token", "artist": "Cek Environment Variables"}).encode())
+                return
+                
             access_token = res_token.json().get('access_token')
 
-            # 2. Ambil Data Lagu
+            # 2. Ambil Data Lagu ke Server Asli Spotify
             res_lagu = requests.get(
                 "https://api.spotify.com/v1/me/player/currently-playing",
                 headers={"Authorization": f"Bearer {access_token}"}
