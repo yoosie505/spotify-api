@@ -24,6 +24,7 @@ MAX_LYRIC_LINES = 48
 MAX_LYRIC_CHARS = 120
 FIRST_SEEN_OFFSET_MS = env_int("FIRST_SEEN_OFFSET_MS", 2200)
 LYRIC_OFFSET_MS = env_int("LYRIC_OFFSET_MS", 800)
+NOWPLAYING_GRACE_MS = env_int("NOWPLAYING_GRACE_MS", 30000)
 
 current_track_key = ""
 current_track_started_at_ms = 0
@@ -35,6 +36,8 @@ lyrics_cache = {
     "duration_ms": 0,
 }
 metadata_cache = {}
+last_playing_payload = None
+last_playing_at_ms = 0
 
 
 def now_ms():
@@ -71,10 +74,21 @@ def is_now_playing(track):
     return track.get("@attr", {}).get("nowplaying") == "true"
 
 
+def track_key(title, artist):
+    return f"{artist.lower()}::{title.lower()}"
+
+
+def looks_like_live_track(track):
+    return is_now_playing(track) or "date" not in track
+
+
 def send_json(handler, payload, status=200):
     handler.send_response(status)
     handler.send_header("Content-type", "application/json")
     handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+    handler.send_header("Pragma", "no-cache")
+    handler.send_header("Expires", "0")
     handler.end_headers()
     handler.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
@@ -90,6 +104,7 @@ def stopped_payload(title="Spotify Terhenti"):
         "current_lyric": "",
         "next_lyric": "",
         "lyrics": [],
+        "source": "stopped",
     }
 
 
@@ -100,6 +115,7 @@ def fetch_lastfm_now_playing():
         "api_key": API_KEY,
         "format": "json",
         "limit": 1,
+        "cb": now_ms(),
     }
     response = requests.get(LASTFM_URL, params=params, timeout=4)
     response.raise_for_status()
@@ -253,53 +269,93 @@ def estimate_progress_ms(track_key, duration_ms):
     return clamp_progress(progress, duration_ms)
 
 
+def build_playing_payload(track, source):
+    title = clean_text(track.get("name"), "Unknown Track")
+    artist = clean_text(track.get("artist", {}).get("#text"), "Unknown Artist")
+    key = track_key(title, artist)
+
+    lyrics_data = fetch_lrclib_lyrics(title, artist, 0)
+    duration_ms = lyrics_data["duration_ms"]
+    album = lyrics_data["album"]
+    if duration_ms < 1000:
+        duration_ms, album = fetch_lastfm_track_info(title, artist)
+        if duration_ms >= 1000:
+            lyrics_data = fetch_lrclib_lyrics(title, artist, duration_ms)
+            if not album:
+                album = lyrics_data["album"]
+
+    progress_ms = estimate_progress_ms(key, duration_ms)
+    lyric_progress_ms = clamp_progress(progress_ms + LYRIC_OFFSET_MS, duration_ms)
+    current_lyric, next_lyric = lyric_at_progress(lyrics_data["lyrics"], lyric_progress_ms)
+    if not current_lyric:
+        current_lyric = lyrics_data["current_lyric"]
+    if not next_lyric:
+        next_lyric = lyrics_data["next_lyric"]
+
+    return {
+        "title": title,
+        "artist": artist,
+        "album": album,
+        "duration_ms": duration_ms,
+        "progress_ms": progress_ms,
+        "lyric_progress_ms": lyric_progress_ms,
+        "lyric_offset_ms": LYRIC_OFFSET_MS,
+        "is_playing": True,
+        "current_lyric": current_lyric,
+        "next_lyric": next_lyric,
+        "lyrics": lyrics_data["lyrics"],
+        "track_key": key,
+        "source": source,
+    }
+
+
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        global last_playing_payload, last_playing_at_ms
+
         if not API_KEY or not USER:
             send_json(self, stopped_payload("API Env Kosong"), status=500)
             return
 
         try:
             track = fetch_lastfm_now_playing()
-            if not track or not is_now_playing(track):
+            current_time = now_ms()
+
+            if not track:
+                if last_playing_payload and current_time - last_playing_at_ms < NOWPLAYING_GRACE_MS:
+                    payload = dict(last_playing_payload)
+                    payload["source"] = "grace_no_track"
+                    send_json(self, payload)
+                    return
                 send_json(self, stopped_payload())
                 return
 
             title = clean_text(track.get("name"), "Unknown Track")
             artist = clean_text(track.get("artist", {}).get("#text"), "Unknown Artist")
-            track_key = f"{artist.lower()}::{title.lower()}"
+            key = track_key(title, artist)
 
-            lyrics_data = fetch_lrclib_lyrics(title, artist, 0)
-            duration_ms = lyrics_data["duration_ms"]
-            album = lyrics_data["album"]
-            if duration_ms < 1000:
-                duration_ms, album = fetch_lastfm_track_info(title, artist)
-                if duration_ms >= 1000:
-                    lyrics_data = fetch_lrclib_lyrics(title, artist, duration_ms)
-                    if not album:
-                        album = lyrics_data["album"]
+            if looks_like_live_track(track):
+                payload = build_playing_payload(track, "lastfm_nowplaying")
+                last_playing_payload = payload
+                last_playing_at_ms = current_time
+                send_json(self, payload)
+                return
 
-            progress_ms = estimate_progress_ms(track_key, duration_ms)
-            lyric_progress_ms = clamp_progress(progress_ms + LYRIC_OFFSET_MS, duration_ms)
-            current_lyric, next_lyric = lyric_at_progress(lyrics_data["lyrics"], lyric_progress_ms)
-            if not current_lyric:
-                current_lyric = lyrics_data["current_lyric"]
-            if not next_lyric:
-                next_lyric = lyrics_data["next_lyric"]
+            if last_playing_payload and current_time - last_playing_at_ms < NOWPLAYING_GRACE_MS:
+                last_key = last_playing_payload.get("track_key", "")
+                if key != last_key:
+                    payload = build_playing_payload(track, "grace_track_changed")
+                    last_playing_payload = payload
+                    last_playing_at_ms = current_time
+                    send_json(self, payload)
+                    return
 
-            send_json(self, {
-                "title": title,
-                "artist": artist,
-                "album": album,
-                "duration_ms": duration_ms,
-                "progress_ms": progress_ms,
-                "lyric_progress_ms": lyric_progress_ms,
-                "lyric_offset_ms": LYRIC_OFFSET_MS,
-                "is_playing": True,
-                "current_lyric": current_lyric,
-                "next_lyric": next_lyric,
-                "lyrics": lyrics_data["lyrics"],
-            })
+                payload = dict(last_playing_payload)
+                payload["source"] = "grace_hold"
+                send_json(self, payload)
+                return
+
+            send_json(self, stopped_payload())
         except Exception as error:
             payload = stopped_payload("API Last.fm Error")
             payload["error"] = str(error)
