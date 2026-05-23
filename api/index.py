@@ -14,7 +14,7 @@ LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
 USER_AGENT = "OLED-Music-Display/1.0"
 
 MAX_LYRIC_LINES = 48
-MAX_LYRIC_CHARS = 44
+MAX_LYRIC_CHARS = 120
 
 current_track_key = ""
 current_track_started_at_ms = 0
