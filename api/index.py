@@ -25,6 +25,7 @@ lyrics_cache = {
     "next_lyric": "",
     "duration_ms": 0,
 }
+metadata_cache = {}
 
 
 def now_ms():
@@ -85,7 +86,7 @@ def fetch_lastfm_now_playing():
         "format": "json",
         "limit": 1,
     }
-    response = requests.get(LASTFM_URL, params=params, timeout=7)
+    response = requests.get(LASTFM_URL, params=params, timeout=4)
     response.raise_for_status()
     data = response.json()
     tracks = data.get("recenttracks", {}).get("track", [])
@@ -95,6 +96,10 @@ def fetch_lastfm_now_playing():
 
 
 def fetch_lastfm_track_info(title, artist):
+    cache_key = f"{artist.lower()}::{title.lower()}"
+    if cache_key in metadata_cache:
+        return metadata_cache[cache_key]
+
     params = {
         "method": "track.getInfo",
         "api_key": API_KEY,
@@ -103,12 +108,13 @@ def fetch_lastfm_track_info(title, artist):
         "format": "json",
         "autocorrect": 1,
     }
-    response = requests.get(LASTFM_URL, params=params, timeout=7)
+    response = requests.get(LASTFM_URL, params=params, timeout=4)
     response.raise_for_status()
     track = response.json().get("track", {})
     duration_ms = safe_int(track.get("duration"), 0)
     album = clean_text(track.get("album", {}).get("title", ""))
-    return duration_ms, album
+    metadata_cache[cache_key] = (duration_ms, album)
+    return metadata_cache[cache_key]
 
 
 def parse_lrc(synced_lyrics):
@@ -177,7 +183,7 @@ def fetch_lrclib_lyrics(title, artist, duration_ms):
             LRCLIB_SEARCH_URL,
             params={"track_name": title, "artist_name": artist},
             headers={"User-Agent": USER_AGENT},
-            timeout=7,
+            timeout=4,
         )
         response.raise_for_status()
         candidates = response.json()
