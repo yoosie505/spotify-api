@@ -9,12 +9,21 @@ import requests
 API_KEY = os.environ.get("LASTFM_API_KEY")
 USER = os.environ.get("LASTFM_USER")
 
+
+def env_int(name, fallback):
+    try:
+        return int(os.environ.get(name, fallback))
+    except (TypeError, ValueError):
+        return fallback
+
 LASTFM_URL = "https://ws.audioscrobbler.com/2.0/"
 LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
 USER_AGENT = "OLED-Music-Display/1.0"
 
 MAX_LYRIC_LINES = 48
 MAX_LYRIC_CHARS = 120
+FIRST_SEEN_OFFSET_MS = env_int("FIRST_SEEN_OFFSET_MS", 2200)
+LYRIC_OFFSET_MS = env_int("LYRIC_OFFSET_MS", 800)
 
 current_track_key = ""
 current_track_started_at_ms = 0
@@ -43,6 +52,12 @@ def safe_int(value, fallback=0):
         return int(float(value))
     except (TypeError, ValueError):
         return fallback
+
+
+def clamp_progress(progress, duration_ms):
+    if duration_ms > 1000:
+        return min(max(progress, 0), duration_ms)
+    return max(progress, 0)
 
 
 def trim_lyric(line):
@@ -176,6 +191,7 @@ def fetch_lrclib_lyrics(title, artist, duration_ms):
         "current_lyric": "",
         "next_lyric": "",
         "duration_ms": 0,
+        "album": "",
     }
 
     try:
@@ -219,6 +235,7 @@ def fetch_lrclib_lyrics(title, artist, duration_ms):
         result["next_lyric"] = plain_lines[1] if len(plain_lines) > 1 else ""
 
     result["duration_ms"] = safe_int(best.get("duration"), 0) * 1000
+    result["album"] = clean_text(best.get("albumName", ""))
     lyrics_cache_key = cache_key
     lyrics_cache = result
     return result
@@ -230,12 +247,10 @@ def estimate_progress_ms(track_key, duration_ms):
     current_time = now_ms()
     if track_key != current_track_key or current_track_started_at_ms == 0:
         current_track_key = track_key
-        current_track_started_at_ms = current_time
+        current_track_started_at_ms = current_time - FIRST_SEEN_OFFSET_MS
 
     progress = current_time - current_track_started_at_ms
-    if duration_ms > 1000:
-        progress = min(progress, duration_ms)
-    return progress
+    return clamp_progress(progress, duration_ms)
 
 
 class handler(BaseHTTPRequestHandler):
@@ -254,13 +269,19 @@ class handler(BaseHTTPRequestHandler):
             artist = clean_text(track.get("artist", {}).get("#text"), "Unknown Artist")
             track_key = f"{artist.lower()}::{title.lower()}"
 
-            duration_ms, album = fetch_lastfm_track_info(title, artist)
-            lyrics_data = fetch_lrclib_lyrics(title, artist, duration_ms)
-            if duration_ms < 1000 and lyrics_data["duration_ms"] >= 1000:
-                duration_ms = lyrics_data["duration_ms"]
+            lyrics_data = fetch_lrclib_lyrics(title, artist, 0)
+            duration_ms = lyrics_data["duration_ms"]
+            album = lyrics_data["album"]
+            if duration_ms < 1000:
+                duration_ms, album = fetch_lastfm_track_info(title, artist)
+                if duration_ms >= 1000:
+                    lyrics_data = fetch_lrclib_lyrics(title, artist, duration_ms)
+                    if not album:
+                        album = lyrics_data["album"]
 
             progress_ms = estimate_progress_ms(track_key, duration_ms)
-            current_lyric, next_lyric = lyric_at_progress(lyrics_data["lyrics"], progress_ms)
+            lyric_progress_ms = clamp_progress(progress_ms + LYRIC_OFFSET_MS, duration_ms)
+            current_lyric, next_lyric = lyric_at_progress(lyrics_data["lyrics"], lyric_progress_ms)
             if not current_lyric:
                 current_lyric = lyrics_data["current_lyric"]
             if not next_lyric:
@@ -272,6 +293,8 @@ class handler(BaseHTTPRequestHandler):
                 "album": album,
                 "duration_ms": duration_ms,
                 "progress_ms": progress_ms,
+                "lyric_progress_ms": lyric_progress_ms,
+                "lyric_offset_ms": LYRIC_OFFSET_MS,
                 "is_playing": True,
                 "current_lyric": current_lyric,
                 "next_lyric": next_lyric,
