@@ -1,62 +1,277 @@
-import os
 import json
-import requests
+import os
+import re
+import time
 from http.server import BaseHTTPRequestHandler
 
-# Ambil rahasia dari Environment Variables Vercel
+import requests
+
 API_KEY = os.environ.get("LASTFM_API_KEY")
 USER = os.environ.get("LASTFM_USER")
 
+LASTFM_URL = "https://ws.audioscrobbler.com/2.0/"
+LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
+USER_AGENT = "OLED-Music-Display/1.0"
+
+MAX_LYRIC_LINES = 48
+MAX_LYRIC_CHARS = 44
+
+current_track_key = ""
+current_track_started_at_ms = 0
+lyrics_cache_key = ""
+lyrics_cache = {
+    "lyrics": [],
+    "current_lyric": "",
+    "next_lyric": "",
+    "duration_ms": 0,
+}
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def clean_text(value, fallback=""):
+    if value is None:
+        return fallback
+    return str(value).replace("\r", " ").replace("\n", " ").strip()
+
+
+def safe_int(value, fallback=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def trim_lyric(line):
+    line = clean_text(line)
+    if len(line) <= MAX_LYRIC_CHARS:
+        return line
+    return line[:MAX_LYRIC_CHARS].rstrip()
+
+
+def is_now_playing(track):
+    return track.get("@attr", {}).get("nowplaying") == "true"
+
+
+def send_json(handler, payload, status=200):
+    handler.send_response(status)
+    handler.send_header("Content-type", "application/json")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+    handler.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+
+def stopped_payload(title="Spotify Terhenti"):
+    return {
+        "title": title,
+        "artist": "-",
+        "album": "",
+        "duration_ms": 0,
+        "progress_ms": 0,
+        "is_playing": False,
+        "current_lyric": "",
+        "next_lyric": "",
+        "lyrics": [],
+    }
+
+
+def fetch_lastfm_now_playing():
+    params = {
+        "method": "user.getrecenttracks",
+        "user": USER,
+        "api_key": API_KEY,
+        "format": "json",
+        "limit": 1,
+    }
+    response = requests.get(LASTFM_URL, params=params, timeout=7)
+    response.raise_for_status()
+    data = response.json()
+    tracks = data.get("recenttracks", {}).get("track", [])
+    if not tracks:
+        return None
+    return tracks[0]
+
+
+def fetch_lastfm_track_info(title, artist):
+    params = {
+        "method": "track.getInfo",
+        "api_key": API_KEY,
+        "artist": artist,
+        "track": title,
+        "format": "json",
+        "autocorrect": 1,
+    }
+    response = requests.get(LASTFM_URL, params=params, timeout=7)
+    response.raise_for_status()
+    track = response.json().get("track", {})
+    duration_ms = safe_int(track.get("duration"), 0)
+    album = clean_text(track.get("album", {}).get("title", ""))
+    return duration_ms, album
+
+
+def parse_lrc(synced_lyrics):
+    lines = []
+    if not synced_lyrics:
+        return lines
+
+    for raw_line in synced_lyrics.splitlines():
+        match = re.match(r"^\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]\s*(.*)$", raw_line)
+        if not match:
+            continue
+
+        minute = safe_int(match.group(1))
+        second = safe_int(match.group(2))
+        fraction = match.group(3) or "0"
+        millis = safe_int(fraction.ljust(3, "0")[:3])
+        words = trim_lyric(match.group(4))
+
+        if not words:
+            continue
+
+        lines.append({
+            "time_ms": ((minute * 60) + second) * 1000 + millis,
+            "words": words,
+        })
+
+        if len(lines) >= MAX_LYRIC_LINES:
+            break
+
+    return lines
+
+
+def lyric_at_progress(lyrics, progress_ms):
+    current = ""
+    next_line = ""
+
+    for index, line in enumerate(lyrics):
+        if line["time_ms"] <= progress_ms:
+            current = line["words"]
+            if index + 1 < len(lyrics):
+                next_line = lyrics[index + 1]["words"]
+        else:
+            if not next_line:
+                next_line = line["words"]
+            break
+
+    return current, next_line
+
+
+def fetch_lrclib_lyrics(title, artist, duration_ms):
+    global lyrics_cache_key, lyrics_cache
+
+    cache_key = f"{artist.lower()}::{title.lower()}::{duration_ms // 1000}"
+    if cache_key == lyrics_cache_key:
+        return lyrics_cache
+
+    result = {
+        "lyrics": [],
+        "current_lyric": "",
+        "next_lyric": "",
+        "duration_ms": 0,
+    }
+
+    try:
+        response = requests.get(
+            LRCLIB_SEARCH_URL,
+            params={"track_name": title, "artist_name": artist},
+            headers={"User-Agent": USER_AGENT},
+            timeout=7,
+        )
+        response.raise_for_status()
+        candidates = response.json()
+    except Exception:
+        lyrics_cache_key = cache_key
+        lyrics_cache = result
+        return result
+
+    if not candidates:
+        lyrics_cache_key = cache_key
+        lyrics_cache = result
+        return result
+
+    duration_sec = duration_ms / 1000 if duration_ms else 0
+
+    def score(item):
+        title_score = 0 if clean_text(item.get("trackName")).lower() == title.lower() else 10
+        artist_score = 0 if artist.lower() in clean_text(item.get("artistName")).lower() else 10
+        item_duration = safe_int(item.get("duration"), 0)
+        duration_score = abs(item_duration - duration_sec) if duration_sec else 0
+        return title_score + artist_score + duration_score
+
+    best = sorted(candidates, key=score)[0]
+    synced = best.get("syncedLyrics") or ""
+    plain = best.get("plainLyrics") or ""
+    lyrics = parse_lrc(synced)
+
+    if lyrics:
+        result["lyrics"] = lyrics
+    elif plain:
+        plain_lines = [trim_lyric(line) for line in plain.splitlines() if trim_lyric(line)]
+        result["current_lyric"] = plain_lines[0] if len(plain_lines) > 0 else ""
+        result["next_lyric"] = plain_lines[1] if len(plain_lines) > 1 else ""
+
+    result["duration_ms"] = safe_int(best.get("duration"), 0) * 1000
+    lyrics_cache_key = cache_key
+    lyrics_cache = result
+    return result
+
+
+def estimate_progress_ms(track_key, duration_ms):
+    global current_track_key, current_track_started_at_ms
+
+    current_time = now_ms()
+    if track_key != current_track_key or current_track_started_at_ms == 0:
+        current_track_key = track_key
+        current_track_started_at_ms = current_time
+
+    progress = current_time - current_track_started_at_ms
+    if duration_ms > 1000:
+        progress = min(progress, duration_ms)
+    return progress
+
+
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*') 
-        self.end_headers()
-
-        url = f"http://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&user={USER}&api_key={API_KEY}&format=json&limit=1"
+        if not API_KEY or not USER:
+            send_json(self, stopped_payload("API Env Kosong"), status=500)
+            return
 
         try:
-            res = requests.get(url)
-            data = res.json()
-            track = data['recenttracks']['track'][0]
+            track = fetch_lastfm_now_playing()
+            if not track or not is_now_playing(track):
+                send_json(self, stopped_payload())
+                return
 
-            # Cek apakah lagu benar-benar SEDANG diputar sekarang (ada tulisan nowplaying)
-            is_playing = False
-            if '@attr' in track and track['@attr'].get('nowplaying') == 'true':
-                is_playing = True
+            title = clean_text(track.get("name"), "Unknown Track")
+            artist = clean_text(track.get("artist", {}).get("#text"), "Unknown Artist")
+            track_key = f"{artist.lower()}::{title.lower()}"
 
-            if is_playing:
-                title = track['name']
-                artist = track['artist']['#text']
-                
-                # Format JSON dikirim lengkap biar C++ kamu aman!
-                hasil_json = {
-                    "title": title,
-                    "artist": artist,
-                    "duration_ms": 0,
-                    "progress_ms": 0,
-                    "is_playing": True,
-                    "current_lyric": "",
-                    "next_lyric": ""
-                }
-                self.wfile.write(json.dumps(hasil_json).encode())
-            else:
-                hasil_pasif = {
-                    "title": "Spotify Terhenti",
-                    "artist": "-",
-                    "duration_ms": 0,
-                    "progress_ms": 0,
-                    "is_playing": False,
-                    "current_lyric": "",
-                    "next_lyric": ""
-                }
-                self.wfile.write(json.dumps(hasil_pasif).encode())
-                
-        except Exception as e:
-            error_json = {
-                "title": "API Last.fm Error",
-                "artist": "-",
-                "is_playing": False
-            }
-            self.wfile.write(json.dumps(error_json).encode())
+            duration_ms, album = fetch_lastfm_track_info(title, artist)
+            lyrics_data = fetch_lrclib_lyrics(title, artist, duration_ms)
+            if duration_ms < 1000 and lyrics_data["duration_ms"] >= 1000:
+                duration_ms = lyrics_data["duration_ms"]
+
+            progress_ms = estimate_progress_ms(track_key, duration_ms)
+            current_lyric, next_lyric = lyric_at_progress(lyrics_data["lyrics"], progress_ms)
+            if not current_lyric:
+                current_lyric = lyrics_data["current_lyric"]
+            if not next_lyric:
+                next_lyric = lyrics_data["next_lyric"]
+
+            send_json(self, {
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "duration_ms": duration_ms,
+                "progress_ms": progress_ms,
+                "is_playing": True,
+                "current_lyric": current_lyric,
+                "next_lyric": next_lyric,
+                "lyrics": lyrics_data["lyrics"],
+            })
+        except Exception as error:
+            payload = stopped_payload("API Last.fm Error")
+            payload["error"] = str(error)
+            send_json(self, payload, status=500)
